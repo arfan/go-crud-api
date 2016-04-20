@@ -8,8 +8,11 @@ import (
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -30,7 +33,7 @@ var (
 	child      = flag.Bool("child", false, "is child proc")
 )
 
-func RequestHandler(w http.ResponseWriter, req *http.Request) {
+func requestHandler(w http.ResponseWriter, req *http.Request) {
 	msg := ""
 	w.Header().Add("Content-Type", "application/json")
 
@@ -152,24 +155,71 @@ func RequestHandler(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprint(w, msg)
 }
 
-func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
+func initDB() {
 	var err error
 	db, err = sql.Open("mysql", connectionString)
 	if err != nil {
-		panic(err.Error())
+		log.Fatalf("Error opening database: %v", err)
 	}
-
 	db.SetMaxIdleConns(maxConnections)
 	db.SetMaxOpenConns(maxConnections)
-
-	// close mysql connection
-	defer db.Close()
-
-	http.HandleFunc("/", RequestHandler)
-	err = http.ListenAndServe(*listenAddr, nil)
-	if err != nil {
-		log.Fatal("ListenAndServe error: ", err)
-	}
 }
+
+func main() {
+	var listener net.Listener
+	flag.Parse()
+	listener = doPrefork()
+
+	initDB()
+
+	http.HandleFunc("/", requestHandler)
+	http.Serve(listener, nil)
+}
+
+func doPrefork() (listener net.Listener) {
+	var err error
+	var fl *os.File
+	var tcplistener *net.TCPListener
+	if !*child {
+		var addr *net.TCPAddr
+		addr, err = net.ResolveTCPAddr("tcp", *listenAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tcplistener, err = net.ListenTCP("tcp", addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fl, err = tcplistener.File()
+		if err != nil {
+			log.Fatal(err)
+		}
+		children := make([]*exec.Cmd, runtime.NumCPU()/2)
+		for i := range children {
+			children[i] = exec.Command(os.Args[0], "-prefork", "-child")
+			children[i].Stdout = os.Stdout
+			children[i].Stderr = os.Stderr
+			children[i].ExtraFiles = []*os.File{fl}
+			err = children[i].Start()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		for _, ch := range children {
+			var err error = ch.Wait()
+			if err != nil {
+				log.Print(err)
+			}
+		}
+		os.Exit(0)
+	} else {
+		fl = os.NewFile(3, "")
+		listener, err = net.FileListener(fl)
+		if err != nil {
+			log.Fatal(err)
+		}
+		runtime.GOMAXPROCS(2)
+	}
+	return listener
+}
+
